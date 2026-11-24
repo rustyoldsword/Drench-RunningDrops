@@ -1,0 +1,1 @@
+DripSim source from https://github.com/antiarc9/DripSim commit 57a5d112cfd91d9c2819a9aa7fe4d4460237be4a, embedded into Drench with the author's permission. Changes are marked 'Drench:'.

@@ -1,0 +1,1083 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 AntiArc. This program is free software: see the LICENSE file (GNU GPL version 3 or later). It comes with NO WARRANTY.
+#include "Spike.h"
+
+#include "Body.h"
+#include "Field.h"
+#include "LogLimit.h"
+#include "Params.h"
+
+// The plugin-owned overlay textures: per surface a 2048x2048 RGBA8 ID3D11Texture2D + view that is put into an existing overlay texture object and
+// rewritten from the frame-end hook, with no DDS load and no skee call (S3). The pixels come from the caller (TextureSetFrame).
+//
+// A surface's texture object comes one of two ways; the shader samples BSGraphics::Texture::resourceView, so replacing that pointer re-skins every
+// shape that uses the object, and restoring it on stop puts everything back:
+//  - donor: the NiSourceTexture of another overlay of the same surface (a tattoo, a spank mark) becomes ours; our free overlay slot is pointed at it.
+//  - placeholder: when the surface has no used overlay to borrow, our free slot's texture set gets a tiny placeholder DDS
+//    (Data\Textures\DripSim\surface_<name>.dds, shipped with the framework) loaded by the engine, and that unique texture object is then replaced.
+// Drench: engine texture fields are real D3D11 types in Drench's CommonLib (REX::W32 in DripSim's): casts below.
+namespace
+{
+    constexpr std::uint32_t kSize = DS::Atlas::kFilm;
+    constexpr double kLoadTimeoutSeconds = 3.0;
+
+    using REX::W32::D3D11_BIND_SHADER_RESOURCE;
+    using REX::W32::D3D11_SUBRESOURCE_DATA;
+    using REX::W32::D3D11_TEXTURE2D_DESC;
+    using REX::W32::D3D11_USAGE_DEFAULT;
+    using REX::W32::ID3D11Resource;
+    using REX::W32::ID3D11ShaderResourceView;
+    using REX::W32::ID3D11Texture2D;
+
+    constexpr std::uint32_t kTilesPerSide = kSize / DS::Atlas::kTile;
+
+    enum class Phase { Idle, Loading, Running };
+    enum class Method { Donor, Placeholder };
+
+    struct Slot
+    {
+        int surface = 0;
+        int owner = 0;
+        Phase phase = Phase::Idle;
+        Method method = Method::Donor;
+        RE::NiPointer<RE::BSGeometry> shape;          // our free overlay slot
+        RE::NiPointer<RE::NiSourceTexture> original;  // its diffuse before we started
+        RE::NiPointer<RE::BSTextureSet> originalSet;  // its texture set before we started
+        float originalAlpha = 1.0f;
+        RE::NiPointer<RE::NiSourceTexture> object;    // the texture object we replaced the contents of (donor or placeholder)
+        ID3D11Resource* objectTexture = nullptr;      // its engine texture + view before we replaced them
+        ID3D11ShaderResourceView* objectView = nullptr;
+        ID3D11Texture2D* texture = nullptr;  // ours
+        ID3D11ShaderResourceView* view = nullptr;
+        std::vector<std::uint32_t> pixels;  // the next frame, RGBA8 (R in the low byte)
+        bool fresh = false;                 // pixels changed since the last upload
+        std::vector<std::uint8_t> dirty;  // 1 per film tile (row-major) changed since the last upload: only these are copied to the GPU
+        std::chrono::steady_clock::time_point loadStarted;
+        bool specSaved = false;  // the material's own specular settings, saved before the first change
+        float origSpecPower = 1.0f;
+        float origSpecScale = 1.0f;
+        float lastPower = -1.0f;
+        float lastScale = -1.0f;
+        bool refrSaved = false;  // spike: the overlay's own refraction flag and power, saved before the first change
+        bool origRefrFlag = false;
+        float origRefrPower = 0.0f;
+        float lastRefr = -1.0f;
+        std::chrono::steady_clock::time_point attachChecked{};  // the last look at whether our overlay shape is still part of the player's 3D
+        bool attached = true;
+        std::uint64_t uploads = 0;
+        double uploadMs = 0;
+        // the optional normal map: a second owned texture swapped into the overlay's normal slot (a unique placeholder DDS is loaded there first)
+        int normalState = 0;  // 0 off, 1 loading, 2 running
+        bool normalTried = false;
+        int normalReclaims = 0;  // Drench: times another mod replaced our normal map and we took the slot back
+        RE::NiPointer<RE::NiSourceTexture> originalNormal;
+        RE::NiPointer<RE::NiSourceTexture> nObject;
+        ID3D11Resource* nObjectTexture = nullptr;
+        ID3D11ShaderResourceView* nObjectView = nullptr;
+        ID3D11Texture2D* nTexture = nullptr;
+        ID3D11ShaderResourceView* nView = nullptr;
+        std::vector<std::uint32_t> nPixels;
+        bool nFresh = false;
+        std::vector<std::uint8_t> nDirty;
+        std::chrono::steady_clock::time_point nStarted;
+        // the optional specular map (SpecMaps=1, rides on the normal map's texture set reload): a third owned texture in slot 7, the gloss of each pixel: wet skin shines, dry does not
+        int specState = 0;  // 0 off, 1 loading, 2 running, 3 gave up, 4 switched off (SpecMaps=0)
+        RE::NiPointer<RE::NiSourceTexture> originalSpec;
+        RE::NiPointer<RE::NiSourceTexture> sObject;
+        ID3D11Resource* sObjectTexture = nullptr;
+        ID3D11ShaderResourceView* sObjectView = nullptr;
+        ID3D11Texture2D* sTexture = nullptr;
+        ID3D11ShaderResourceView* sView = nullptr;
+        std::vector<std::uint32_t> sPixels;
+        bool sFresh = false;
+        std::vector<std::uint8_t> sDirty;
+        // PremultipliedAlpha=1: our own copy of the overlay's alpha property with the source blend ONE (out = colour + skin x (1 - alpha)); the film's colours are then
+        // premultiplied, which looks the same, but the shine the engine adds is no longer scaled down by the film's low opacity (wet skin is ~20 % opaque)
+        RE::NiPointer<RE::NiAlphaProperty> originalAlphaProp;
+        std::uint16_t origAlphaFlags = 0;
+        bool alphaFlagsSaved = false;
+        int premulApplied = -1;  // -1 not touched, 0 off, 1 on
+        // SPIKE (OverlayDecal=1): the overlay drawn as a decal (depth bias), against z-fighting with the skin mesh under it
+        bool decalSaved = false;
+        bool origDecal = false;
+        bool origDynDecal = false;
+        bool origZWrite = true;
+        int decalApplied = -1;  // -1 not touched, 0 off, 1 on
+        bool flagsLogged = false;
+    };
+    std::array<Slot, DS::Surface::Count> g_slots;
+
+    // The skin material's real shine, kept across runs (a Slot is cleared on every stop). After an overlay refresh (clothes change, RaceMenu) the material
+    // can still carry DripSim's wet values when the next run starts; saving those as the "original" made the skin stay glossy after the rain, and the values
+    // grew run after run (a player's report 2026-11-14: power 30 -> 87.7 -> 330, scale 3 -> 10). So: if the material holds exactly what DripSim set last,
+    // the remembered original is used.
+    struct SpecMemory
+    {
+        bool known = false;
+        float power = 0.0f, scale = 0.0f;  // the real material values
+        bool set = false;
+        float setPower = 0.0f, setScale = 0.0f;  // what DripSim wrote last
+    };
+    std::array<SpecMemory, DS::Surface::Count> g_specMemory;
+
+    bool g_normalMaps = false;
+    bool g_specMaps = false;
+    bool g_premul = false;
+    std::mutex g_mutex;  // the main-thread hook (start/stop/pixels) and the frame-end hook may be different threads
+
+    Slot& SlotOf(int surface)
+    {
+        return g_slots[static_cast<std::size_t>(std::clamp(surface, 0, static_cast<int>(DS::Surface::Count) - 1))];
+    }
+
+    RE::BSLightingShaderMaterialBase* MaterialOf(RE::BSGeometry* geometry)
+    {
+        auto* lighting = geometry ? geometry->lightingShaderProp_cast() : nullptr;
+        return lighting ? static_cast<RE::BSLightingShaderMaterialBase*>(lighting->GetBaseMaterial()) : nullptr;
+    }
+
+
+    // True virtual dispatch on the material's own vtable (slot 8 = OnLoadTextureSet, 9 = ClearTextures), like skee does. CommonLibSSE-NG's
+    // wrappers of these two call the base class implementation (BSLightingShaderMaterialBase's vtable), which is wrong for derived materials.
+    void LoadTextureSet(RE::BSLightingShaderMaterialBase* material, RE::BSTextureSet* set)
+    {
+        using Fn = void (*)(RE::BSLightingShaderMaterialBase*, std::uint64_t, RE::BSTextureSet*);
+        auto** vtable = *reinterpret_cast<void***>(material);
+        reinterpret_cast<Fn>(vtable[8])(material, 0, set);
+    }
+
+    void ClearTextures(RE::BSLightingShaderMaterialBase* material)
+    {
+        using Fn = void (*)(RE::BSLightingShaderMaterialBase*);
+        auto** vtable = *reinterpret_cast<void***>(material);
+        reinterpret_cast<Fn>(vtable[9])(material);
+    }
+
+    void SetRefractionFlag(RE::BSLightingShaderProperty* lighting, bool on)
+    {
+        if (on) lighting->flags.set(RE::BSShaderProperty::EShaderPropertyFlag::kRefraction);
+        else lighting->flags.reset(RE::BSShaderProperty::EShaderPropertyFlag::kRefraction);
+    }
+
+    bool IsBlank(const char* path)
+    {
+        std::string lower = path ? path : "";
+        std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lower.empty() || lower.find("default.dds") != std::string::npos;
+    }
+
+    // A slot that still shows DripSim's own placeholder: our slot from an earlier run that could not be given back (the body or the overlay went away first,
+    // or RaceMenu stored the path in a save). It is ours, so it counts as free; before, each such slot was lost for good (game log 2026-11-12: all 10 body slots taken).
+    bool IsOurs(const char* path)
+    {
+        std::string lower = path ? path : "";
+        std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lower.find("drips\\surface_") != std::string::npos || lower.find("drips/surface_") != std::string::npos;  // Drench: textures\Drench\Drips
+    }
+
+    // Drench: another mod replaced only the overlay's normal map. Our texture goes off the old object (back to its own), and the
+    // slot is set up again on the next frame (EnsureNormal), up to 5 times a run; after that the drops go on without a normal map.
+    void ReclaimNormalLocked(Slot& s)
+    {
+        if (auto* renderer = s.nObject ? s.nObject->rendererTexture : nullptr) {
+            renderer->texture = reinterpret_cast<decltype(renderer->texture)>(s.nObjectTexture);
+            renderer->resourceView = reinterpret_cast<decltype(renderer->resourceView)>(s.nObjectView);
+        }
+        if (s.nView) s.nView->Release();
+        if (s.nTexture) s.nTexture->Release();
+        s.nView = nullptr;
+        s.nTexture = nullptr;
+        s.nObject.reset();
+        s.nObjectTexture = nullptr;
+        s.nObjectView = nullptr;
+        s.nPixels.clear();
+        s.nDirty.clear();
+        if (++s.normalReclaims <= 5) {
+            s.normalState = 0;
+            s.normalTried = false;
+        } else {
+            s.normalState = 3;  // the overlay keeps the other mod's normal map; the set is restored on stop
+        }
+    }
+
+    void ReleaseD3D(Slot& s)
+    {
+        if (s.view) s.view->Release();
+        if (s.texture) s.texture->Release();
+        s.view = nullptr;
+        s.texture = nullptr;
+        if (s.nView) s.nView->Release();
+        if (s.nTexture) s.nTexture->Release();
+        s.nView = nullptr;
+        s.nTexture = nullptr;
+        if (s.sView) s.sView->Release();
+        if (s.sTexture) s.sTexture->Release();
+        s.sView = nullptr;
+        s.sTexture = nullptr;
+    }
+
+    // Puts the texture object's own texture and view back, restores our slot's texture, releases ours. Caller holds g_mutex.
+    void StopLocked(Slot& s, const char* why)
+    {
+        if (s.phase == Phase::Idle) return;
+        if (auto* renderer = s.object ? s.object->rendererTexture : nullptr) {
+            if (s.objectView) {  // only once it was swapped
+                renderer->texture = reinterpret_cast<decltype(renderer->texture)>(s.objectTexture);
+                renderer->resourceView = reinterpret_cast<decltype(renderer->resourceView)>(s.objectView);
+            }
+        }
+        if (s.normalState == 2) {
+            if (auto* renderer = s.nObject ? s.nObject->rendererTexture : nullptr) {
+                renderer->texture = reinterpret_cast<decltype(renderer->texture)>(s.nObjectTexture);
+                renderer->resourceView = reinterpret_cast<decltype(renderer->resourceView)>(s.nObjectView);
+            }
+        }
+        if (s.specState == 2) {
+            if (auto* renderer = s.sObject ? s.sObject->rendererTexture : nullptr) {
+                renderer->texture = reinterpret_cast<decltype(renderer->texture)>(s.sObjectTexture);
+                renderer->resourceView = reinterpret_cast<decltype(renderer->resourceView)>(s.sObjectView);
+            }
+        }
+        auto* material = MaterialOf(s.shape.get());
+        auto* lighting = s.shape ? s.shape->lightingShaderProp_cast() : nullptr;
+        if (material && lighting && s.refrSaved) {  // the refraction spike: back to what the overlay had
+            material->refractionPower = s.origRefrPower;
+            SetRefractionFlag(lighting, s.origRefrFlag);
+            lighting->DoClearRenderPasses();
+            s.refrSaved = false;
+            s.lastRefr = -1.0f;
+        }
+        if (s.alphaFlagsSaved && s.originalAlphaProp && s.premulApplied == 1) {  // the overlay's own blend flags back
+            s.originalAlphaProp->alphaFlags = s.origAlphaFlags;
+            if (lighting) lighting->DoClearRenderPasses();
+        }
+        if (lighting && s.decalSaved) {  // the decal spike: the overlay's own flags back
+            using F = RE::BSShaderProperty::EShaderPropertyFlag;
+            if (s.origDecal) lighting->flags.set(F::kDecal);
+            else lighting->flags.reset(F::kDecal);
+            if (s.origDynDecal) lighting->flags.set(F::kDynamicDecal);
+            else lighting->flags.reset(F::kDynamicDecal);
+            if (s.origZWrite) lighting->flags.set(F::kZBufferWrite);
+            else lighting->flags.reset(F::kZBufferWrite);
+            lighting->DoClearRenderPasses();
+        }
+        if (material && s.specSaved) {
+            material->specularPower = s.origSpecPower;
+            material->specularColorScale = s.origSpecScale;
+        }
+        if (material && lighting) {
+            if ((s.method == Method::Placeholder || s.normalState != 0) && s.originalSet) {
+                ClearTextures(material);
+                LoadTextureSet(material, s.originalSet.get());
+            }
+            material->diffuseTexture = s.original;
+            lighting->SetMaterialAlpha(s.originalAlpha);
+        }
+        ReleaseD3D(s);
+        if (DS::LogAllow("tex-stopped")) logger::info("Texture {}: stopped ({}) after {} uploads", DS::Surface::Name(s.surface), why, s.uploads);
+        const int surface = s.surface;
+        s = Slot{};
+        s.surface = surface;
+    }
+
+    // Creates our D3D texture and swaps it into the texture object. Caller holds g_mutex.
+    bool SwapIn(Slot& s)
+    {
+        auto* device = RE::BSGraphics::Renderer::GetDevice();
+        if (!device || !s.object || !s.object->rendererTexture) return false;
+        std::vector<std::uint32_t> blank(static_cast<std::size_t>(kSize) * kSize, 0u);
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.width = kSize;
+        desc.height = kSize;
+        desc.mipLevels = 1;
+        desc.arraySize = 1;
+        desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.sampleDesc.count = 1;
+        desc.usage = D3D11_USAGE_DEFAULT;
+        desc.bindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{};
+        init.sysMem = blank.data();
+        init.sysMemPitch = kSize * 4;
+        ID3D11Texture2D* texture = nullptr;
+        if (device->CreateTexture2D(&desc, &init, &texture) < 0 || !texture) {
+            logger::error("Texture {}: CreateTexture2D failed", DS::Surface::Name(s.surface));
+            return false;
+        }
+        ID3D11ShaderResourceView* view = nullptr;
+        if (device->CreateShaderResourceView(texture, nullptr, &view) < 0 || !view) {
+            logger::error("Texture {}: CreateShaderResourceView failed", DS::Surface::Name(s.surface));
+            texture->Release();
+            return false;
+        }
+        s.texture = texture;
+        s.view = view;
+        s.pixels = std::move(blank);
+        s.dirty.assign(static_cast<std::size_t>(kTilesPerSide) * kTilesPerSide, 0);
+        s.objectTexture = reinterpret_cast<decltype(s.objectTexture)>(s.object->rendererTexture->texture);
+        s.objectView = reinterpret_cast<decltype(s.objectView)>(s.object->rendererTexture->resourceView);
+        s.object->rendererTexture->texture = reinterpret_cast<decltype(s.object->rendererTexture->texture)>(texture);
+        s.object->rendererTexture->resourceView = reinterpret_cast<decltype(s.object->rendererTexture->resourceView)>(view);
+        return true;
+    }
+
+    // A second owned texture for the normal slot: the overlay's texture set is reloaded with a unique placeholder normal DDS (diffuse kept as it is), then,
+    // once the engine has loaded it, that texture object's contents are replaced like the diffuse one. Only for model-space-normal overlays.
+    void BeginNormalLocked(Slot& s)
+    {
+        if (s.normalTried || s.normalState != 0 || s.phase != Phase::Running) return;
+        s.normalTried = true;
+        auto* material = MaterialOf(s.shape.get());
+        auto* lighting = s.shape ? s.shape->lightingShaderProp_cast() : nullptr;
+        if (!material || !lighting || !s.originalSet) return;
+        const bool modelSpace = lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kModelSpaceNormals);
+        const char* path = s.originalSet->GetTexturePath(RE::BSTextureSet::Texture::kNormal);
+        if (DS::LogAllow("tex-normal-overlay")) logger::info("Texture {}: overlay '{}' normal map '{}', model-space flag {}", DS::Surface::Name(s.surface), s.shape->name.c_str(), path ? path : "-", modelSpace ? "set" : "NOT set");
+        if (!modelSpace) {
+            logger::warn("Texture {}: the overlay is not model-space-normal; the normal map is skipped (it would be read as tangent-space)", DS::Surface::Name(s.surface));
+            return;
+        }
+        auto* set = RE::BSShaderTextureSet::Create();
+        if (!set) return;
+        for (int i = 0; i < 9; ++i) {
+            const char* p = s.originalSet->GetTexturePath(static_cast<RE::BSTextureSet::Texture>(i));
+            if (p && *p) set->SetTexturePath(static_cast<RE::BSTextureSet::Texture>(i), p);
+        }
+        const std::string placeholder = std::format("Drench\\Drips\\surface_{}_n.dds", DS::Surface::Name(s.surface));
+        set->SetTexturePath(RE::BSTextureSet::Texture::kNormal, placeholder.c_str());
+        const char* specPath = s.originalSet->GetTexturePath(RE::BSTextureSet::Texture::kSpecular);
+        if (DS::LogAllow("tex-spec-overlay")) logger::info("Texture {}: overlay specular map (slot 7) '{}'", DS::Surface::Name(s.surface), specPath && *specPath ? specPath : "-");
+        if (g_specMaps) {
+            const std::string specPlaceholder = std::format("Drench\\Drips\\surface_{}_s.dds", DS::Surface::Name(s.surface));
+            set->SetTexturePath(RE::BSTextureSet::Texture::kSpecular, specPlaceholder.c_str());
+            if (s.specState == 0) {  // Drench: a normal-map reclaim keeps the running specular map
+                s.originalSpec = material->specularBackLightingTexture;
+                s.specState = 1;
+            }
+        }
+        RE::NiPointer<RE::BSTextureSet> keep(set);
+        RE::NiPointer<RE::NiSourceTexture> diffuse = material->diffuseTexture;
+        s.originalNormal = material->normalTexture;
+        ClearTextures(material);
+        LoadTextureSet(material, set);
+        material->diffuseTexture = diffuse;  // ours stays
+        if (s.specState == 2 && s.sObject) material->specularBackLightingTexture = s.sObject;  // Drench: so does a running specular map
+        s.lastPower = -1.0f;                 // the reload may have touched the specular values: apply them again
+        s.lastScale = -1.0f;
+        s.nStarted = std::chrono::steady_clock::now();
+        s.normalState = 1;
+        if (DS::LogAllow("tex-normal-load")) logger::info("Texture {}: loading the normal placeholder {}", DS::Surface::Name(s.surface), placeholder);
+    }
+
+    void PollNormalLocked(Slot& s)
+    {
+        if (s.normalState != 1) return;
+        auto* material = MaterialOf(s.shape.get());
+        auto* normal = material ? material->normalTexture.get() : nullptr;
+        if (normal && normal != s.originalNormal.get() && normal->rendererTexture && normal->rendererTexture->resourceView) {
+            auto* device = RE::BSGraphics::Renderer::GetDevice();
+            if (!device) return;
+            std::vector<std::uint32_t> flat(static_cast<std::size_t>(kSize) * kSize, 0xFFFF8080u);  // straight up in the game's model-space encoding
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.width = kSize;
+            desc.height = kSize;
+            desc.mipLevels = 1;
+            desc.arraySize = 1;
+            desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.sampleDesc.count = 1;
+            desc.usage = D3D11_USAGE_DEFAULT;
+            desc.bindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init{};
+            init.sysMem = flat.data();
+            init.sysMemPitch = kSize * 4;
+            ID3D11Texture2D* texture = nullptr;
+            ID3D11ShaderResourceView* view = nullptr;
+            if (device->CreateTexture2D(&desc, &init, &texture) < 0 || !texture || device->CreateShaderResourceView(texture, nullptr, &view) < 0 || !view) {
+                if (texture) texture->Release();
+                logger::error("Texture {}: could not create the normal texture", DS::Surface::Name(s.surface));
+                s.normalState = 3;  // gave up; the set is restored on stop
+                return;
+            }
+            s.nObject.reset(normal);
+            s.nObjectTexture = reinterpret_cast<decltype(s.nObjectTexture)>(normal->rendererTexture->texture);
+            s.nObjectView = reinterpret_cast<decltype(s.nObjectView)>(normal->rendererTexture->resourceView);
+            normal->rendererTexture->texture = reinterpret_cast<decltype(normal->rendererTexture->texture)>(texture);
+            normal->rendererTexture->resourceView = reinterpret_cast<decltype(normal->rendererTexture->resourceView)>(view);
+            s.nTexture = texture;
+            s.nView = view;
+            s.nPixels = std::move(flat);
+            s.nDirty.assign(static_cast<std::size_t>(kTilesPerSide) * kTilesPerSide, 0);
+            s.normalState = 2;
+            if (DS::LogAllow("tex-normal-run")) logger::info("Texture {}: normal map running ({}x{} owned texture)", DS::Surface::Name(s.surface), kSize, kSize);
+            return;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s.nStarted).count() > kLoadTimeoutSeconds) {
+            logger::warn("Texture {}: the normal placeholder did not load (Data\\Textures\\Drench\\Drips\\surface_{}_n.dds missing?); no normal map", DS::Surface::Name(s.surface), DS::Surface::Name(s.surface));
+            s.normalState = 3;
+        }
+    }
+
+    // The specular placeholder loaded: its texture object gets our texture (black = no gloss; the film writes where the skin is wet).
+    void PollSpecLocked(Slot& s)
+    {
+        if (s.specState != 1) return;
+        auto* material = MaterialOf(s.shape.get());
+        auto* spec = material ? material->specularBackLightingTexture.get() : nullptr;
+        if (spec && spec != s.originalSpec.get() && spec->rendererTexture && spec->rendererTexture->resourceView) {
+            auto* device = RE::BSGraphics::Renderer::GetDevice();
+            if (!device) return;
+            std::vector<std::uint32_t> black(static_cast<std::size_t>(kSize) * kSize, 0xFF000000u);
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.width = kSize;
+            desc.height = kSize;
+            desc.mipLevels = 1;
+            desc.arraySize = 1;
+            desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.sampleDesc.count = 1;
+            desc.usage = D3D11_USAGE_DEFAULT;
+            desc.bindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init{};
+            init.sysMem = black.data();
+            init.sysMemPitch = kSize * 4;
+            ID3D11Texture2D* texture = nullptr;
+            ID3D11ShaderResourceView* view = nullptr;
+            if (device->CreateTexture2D(&desc, &init, &texture) < 0 || !texture || device->CreateShaderResourceView(texture, nullptr, &view) < 0 || !view) {
+                if (texture) texture->Release();
+                logger::error("Texture {}: could not create the specular texture", DS::Surface::Name(s.surface));
+                s.specState = 3;
+                return;
+            }
+            s.sObject.reset(spec);
+            s.sObjectTexture = reinterpret_cast<decltype(s.sObjectTexture)>(spec->rendererTexture->texture);
+            s.sObjectView = reinterpret_cast<decltype(s.sObjectView)>(spec->rendererTexture->resourceView);
+            spec->rendererTexture->texture = reinterpret_cast<decltype(spec->rendererTexture->texture)>(texture);
+            spec->rendererTexture->resourceView = reinterpret_cast<decltype(spec->rendererTexture->resourceView)>(view);
+            s.sTexture = texture;
+            s.sView = view;
+            s.sPixels = std::move(black);
+            s.sDirty.assign(static_cast<std::size_t>(kTilesPerSide) * kTilesPerSide, 0);
+            s.specState = 2;
+            if (DS::LogAllow("tex-spec-run")) logger::info("Texture {}: specular map running ({}x{} owned texture)", DS::Surface::Name(s.surface), kSize, kSize);
+            return;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s.nStarted).count() > kLoadTimeoutSeconds) {
+            logger::warn("Texture {}: the specular placeholder did not load (Data\\Textures\\Drench\\Drips\\surface_{}_s.dds missing?); no specular map", DS::Surface::Name(s.surface), DS::Surface::Name(s.surface));
+            s.specState = 3;
+        }
+    }
+
+    // PremultipliedAlpha (off by default): the overlay's blend becomes src ONE, dst 1 - src alpha. Changed IN PLACE on the shape's own alpha property (NiObject::Clone
+    // shared it instead of copying: game log 2026-11-12) and the original flags are written back on off / stop. In game this made the body black and opaque
+    // in shadow (some shader variant), so it stays off; the shine is compensated in the gloss map instead (Film.cpp).
+    void ApplyPremulLocked(Slot& s, bool on)
+    {
+        auto& data = s.shape->GetGeometryRuntimeData();
+        auto* lighting = s.shape->lightingShaderProp_cast();
+        auto* alpha = data.alphaProperty.get();
+        if (!alpha) {
+            s.premulApplied = 0;
+            return;
+        }
+        if (on) {
+            if (!s.alphaFlagsSaved) {
+                s.origAlphaFlags = alpha->alphaFlags;
+                s.alphaFlagsSaved = true;
+                s.originalAlphaProp.reset(alpha);
+            }
+            alpha->SetAlphaBlending(true);
+            alpha->SetSrcBlendMode(RE::NiAlphaProperty::AlphaFunction::kOne);
+            alpha->SetDestBlendMode(RE::NiAlphaProperty::AlphaFunction::kInvSrcAlpha);
+            if (lighting) lighting->DoClearRenderPasses();
+            if (DS::LogAllow("tex-premul")) logger::info("Texture {}: premultiplied alpha ON (original alpha flags 0x{:04X}: blending {}, src {}, dst {})", DS::Surface::Name(s.surface), s.origAlphaFlags,
+                (s.origAlphaFlags & 1) != 0, (s.origAlphaFlags >> 1) & 15, (s.origAlphaFlags >> 5) & 15);
+            s.premulApplied = 1;
+        } else {
+            if (s.alphaFlagsSaved && s.premulApplied == 1 && s.originalAlphaProp.get() == alpha) {
+                alpha->alphaFlags = s.origAlphaFlags;
+                if (lighting) lighting->DoClearRenderPasses();
+                if (DS::LogAllow("tex-premul")) logger::info("Texture {}: premultiplied alpha off (alpha flags 0x{:04X} back)", DS::Surface::Name(s.surface), s.origAlphaFlags);
+            }
+            s.premulApplied = 0;
+        }
+    }
+
+    // What the uploads cost on the render thread (summed since the last PERF line, read by TextureTakeUploadStats).
+    std::atomic<std::uint64_t> g_upBytes{ 0 };
+    std::atomic<std::uint64_t> g_upCalls{ 0 };
+    std::atomic<std::uint64_t> g_upFrames{ 0 };
+    std::atomic<std::int64_t> g_upNs{ 0 };
+    std::atomic<std::int64_t> g_upWorstNs{ 0 };
+    std::atomic<std::int64_t> g_upLockNs{ 0 };  // waiting for g_mutex
+
+    // Copies the dirty tiles of `pixels` into `texture`: one UpdateSubresource per run of neighbouring dirty tiles in a tile row (gaps of up to 2 clean tiles are bridged), instead
+    // of one box around everything: a soak changes tiles all over the atlas, and the bounding box of those is the whole 16 MB texture.
+    template <class Context, class Texture>
+    void UploadDirty(Context* context, Texture* texture, const std::uint32_t* pixels, std::vector<std::uint8_t>& dirty)
+    {
+        constexpr std::uint32_t kTile = DS::Atlas::kTile;
+        for (std::uint32_t ty = 0; ty < kTilesPerSide; ++ty) {
+            const std::uint8_t* row = &dirty[static_cast<std::size_t>(ty) * kTilesPerSide];
+            std::uint32_t tx = 0;
+            while (tx < kTilesPerSide) {
+                if (!row[tx]) {
+                    ++tx;
+                    continue;
+                }
+                std::uint32_t last = tx;
+                std::uint32_t gap = 0;
+                for (std::uint32_t t = tx + 1; t < kTilesPerSide; ++t) {
+                    if (row[t]) {
+                        last = t;
+                        gap = 0;
+                    } else if (++gap > 2) {
+                        break;
+                    }
+                }
+                REX::W32::D3D11_BOX box{ tx * kTile, ty * kTile, 0, (last + 1) * kTile, (ty + 1) * kTile, 1 };
+                const void* source = pixels + static_cast<std::size_t>(ty * kTile) * kSize + tx * kTile;  // the box top-left corner; the pitch steps rows
+                context->UpdateSubresource(texture, 0, &box, source, kSize * 4, 0);
+                g_upBytes += static_cast<std::uint64_t>(last + 1 - tx) * kTile * kTile * 4;
+                ++g_upCalls;
+                std::fill(dirty.begin() + static_cast<std::ptrdiff_t>(ty * kTilesPerSide + tx), dirty.begin() + static_cast<std::ptrdiff_t>(ty * kTilesPerSide + last + 1), std::uint8_t{ 0 });
+                tx = last + 1;
+            }
+        }
+    }
+
+    // The render call at the end of each frame, same call Skygram hooks (SE 75461 + 0x9). Uploads this frame's pixels.
+    struct FrameEndHook
+    {
+        static void thunk(std::uint32_t a_syncInterval)
+        {
+            Upload();
+            DS::Spike::BodyRenderWork();
+            func(a_syncInterval);
+        }
+
+        static void Upload()
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::scoped_lock lock(g_mutex);
+            const auto t1 = std::chrono::steady_clock::now();
+            auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
+            auto* context = renderer ? renderer->GetRuntimeData().context : nullptr;
+            if (!context) return;
+            bool any = false;
+            for (auto& s : g_slots) {
+                if (s.phase == Phase::Running && s.normalState == 2 && s.nTexture && s.nFresh) {
+                    UploadDirty(context, s.nTexture, s.nPixels.data(), s.nDirty);
+                    s.nFresh = false;
+                    any = true;
+                }
+                if (s.phase == Phase::Running && s.specState == 2 && s.sTexture && s.sFresh) {
+                    UploadDirty(context, s.sTexture, s.sPixels.data(), s.sDirty);
+                    s.sFresh = false;
+                    any = true;
+                }
+                if (s.phase != Phase::Running || !s.texture || !s.fresh) continue;
+                UploadDirty(context, s.texture, s.pixels.data(), s.dirty);
+                s.fresh = false;
+                any = true;
+                ++s.uploads;
+            }
+            if (!any) return;
+            const auto t2 = std::chrono::steady_clock::now();
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            g_upNs += ns;
+            g_upLockNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            ++g_upFrames;
+            auto worst = g_upWorstNs.load();
+            while (ns > worst && !g_upWorstNs.compare_exchange_weak(worst, ns)) {
+            }
+        }
+
+        static inline REL::Relocation<decltype(thunk)> func;
+    };
+
+    // Step 2 of the placeholder method: once the engine has loaded the placeholder DDS, replace its contents.
+    int PollLocked(Slot& s)
+    {
+        if (s.phase != Phase::Loading) return s.phase == Phase::Running ? 1 : 0;
+        auto* material = MaterialOf(s.shape.get());
+        auto* diffuse = material ? material->diffuseTexture.get() : nullptr;
+        if (diffuse && diffuse != s.original.get() && diffuse->rendererTexture && diffuse->rendererTexture->resourceView) {
+            s.object.reset(diffuse);
+            if (SwapIn(s)) {
+                s.phase = Phase::Running;
+                if (DS::LogAllow("tex-running")) logger::info("Texture {}: placeholder loaded and replaced; running", DS::Surface::Name(s.surface));
+                return 1;
+            }
+            StopLocked(s, "swap failed");
+            return 0;
+        }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s.loadStarted).count() > kLoadTimeoutSeconds) {
+            logger::warn("Texture {}: the placeholder texture did not load (is Data\\Textures\\Drench\\Drips\\surface_{}.dds there?)", DS::Surface::Name(s.surface), DS::Surface::Name(s.surface));
+            StopLocked(s, "placeholder did not load");
+            return 0;
+        }
+        return 2;
+    }
+}
+
+namespace DS::Spike
+{
+    std::uintptr_t TextureHookSite()
+    {
+        REL::Relocation<std::uintptr_t> frameEnd{ REL::VariantID(75461, 77246, 0xDBBDD0) };
+        return frameEnd.address() + REL::VariantOffset(0x9, 0x9, 0x15).offset();
+    }
+
+    void InstallTextureHook()
+    {
+        FrameEndHook::func = SKSE::GetTrampoline().write_call<5>(TextureHookSite(), FrameEndHook::thunk);
+        logger::info("Texture: frame-end hook installed");
+    }
+
+    // Main thread, once per frame: stop a surface whose overlay or the player's 3D went away.
+    void TextureOnFrame()
+    {
+        std::scoped_lock lock(g_mutex);
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        const bool alive = player && player->Is3DLoaded() && player->Get3D(false);
+        for (auto& s : g_slots) {
+            if (s.phase == Phase::Idle) continue;
+            if (alive && g_normalMaps && s.phase == Phase::Running) {
+                BeginNormalLocked(s);
+                PollNormalLocked(s);
+                PollSpecLocked(s);
+            }
+            if (s.specState == 2 && !g_specMaps) {  // SpecMaps=0 + F10: the engine's own specular texture back at once (ours stays allocated until the stop)
+                if (auto* renderer = s.sObject ? s.sObject->rendererTexture : nullptr) {
+                    renderer->texture = reinterpret_cast<decltype(renderer->texture)>(s.sObjectTexture);
+                    renderer->resourceView = reinterpret_cast<decltype(renderer->resourceView)>(s.sObjectView);
+                }
+                s.specState = 4;
+                if (DS::LogAllow("tex-spec-off")) logger::info("Texture {}: specular map switched off (SpecMaps=0)", DS::Surface::Name(s.surface));
+            }
+            if (alive && s.phase == Phase::Running && s.shape && s.premulApplied != (g_premul ? 1 : 0)) {
+                ApplyPremulLocked(s, g_premul);
+            }
+            if (!alive) {
+                StopLocked(s, "player 3D gone");
+            } else if (!s.shape || !s.shape->parent || !MaterialOf(s.shape.get())) {
+                StopLocked(s, "overlay shape lost");
+            } else if (s.phase == Phase::Running) {
+                // A clothes change / overlay refresh (skee, QueueNiNodeUpdate) reloads the overlay's material: the shape stays but its textures are the engine's again
+                // and our image is on an object nobody draws. Stop; the modes restart from a fresh capture (rain does it by itself while it rains).
+                auto* material = MaterialOf(s.shape.get());
+                if (s.object && material->diffuseTexture.get() != s.object.get()) {
+                    // what is there now: the name of the texture that replaced ours, and whether the shape itself is still part of the player's 3D (tells a rebuilt 3D from a texture reload)
+                    const auto* now = material->diffuseTexture.get();
+                    if (DS::LogAllow("tex-reset-why", 5)) logger::info("Texture {}: the diffuse texture is now '{}' (ours: {} uploads, shape '{}' in the player's 3D: {})", DS::Surface::Name(s.surface),
+                        now && now->name.c_str() ? now->name.c_str() : "(none)", s.uploads, s.shape->name.c_str(), s.shape->parent != nullptr);
+                    StopLocked(s, "overlay textures were reset (clothes change or overlay refresh)");
+                } else if (s.normalState == 2 && s.nObject && material->normalTexture.get() != s.nObject.get()) {
+                    const auto* now = material->normalTexture.get();
+                    if (DS::LogAllow("tex-reset-why-n", 5)) logger::info("Texture {}: the normal map is now '{}' (ours: {} uploads)", DS::Surface::Name(s.surface), now && now->name.c_str() ? now->name.c_str() : "(none)", s.uploads);
+                    ReclaimNormalLocked(s);  // Drench: was StopLocked, which stopped every mode whenever Mu Dynamic NormalMap rebuilt the body
+                    if (DS::LogAllow("tex-reclaim-n", 10)) logger::info("Texture {}: {}", DS::Surface::Name(s.surface), s.normalState == 0 ? "normal map taken back" : "normal map left to the other mod (too many takeovers)");
+                }
+            }
+        }
+    }
+
+    int TextureStart(int surface, int owner)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Idle && s.owner != owner) {
+            logger::warn("Texture {}: already in use by another owner ({}); not started", DS::Surface::Name(surface), s.owner);
+            return 0;
+        }
+        if (s.phase == Phase::Running) return 1;
+        if (s.phase == Phase::Loading) return PollLocked(s);
+        s.surface = surface;
+        s.owner = owner;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* root = player && player->Is3DLoaded() ? player->Get3D(false) : nullptr;
+        if (!root || !RE::BSGraphics::Renderer::GetDevice()) {
+            logger::warn("Texture {}: no player 3D or no D3D device", DS::Surface::Name(surface));
+            return 0;
+        }
+        RE::BSGeometry* ours = nullptr;
+        RE::NiSourceTexture* donor = nullptr;
+        for (int i = 9; i >= 0; --i) {
+            auto* object = root->GetObjectByName(RE::BSFixedString(std::format("{} [Ovl{}]", DS::Surface::Prefix(surface), i)));
+            auto* geometry = object ? object->AsGeometry() : nullptr;
+            auto* material = MaterialOf(geometry);
+            if (!geometry || !material || !material->diffuseTexture) continue;
+            auto set = material->GetTextureSet();
+            const char* path = set ? set->GetTexturePath(RE::BSTextureSet::Texture::kDiffuse) : nullptr;
+            // the texture the slot really draws: another tool that swaps textures the same way (DripSim / HeavyMagic) keeps the overlay's own (blank) paths in the set,
+            // so the set alone called its slot free; two tools in one slot reloaded each other's material and freed textures still in use (GPU driver crash 2026-11-18)
+            const char* live = material->diffuseTexture->name.c_str();
+            const bool liveFree = !live || !*live || IsBlank(live) || IsOurs(live);
+            if (!liveFree && IsBlank(path) && DS::LogAllow(std::format("tex-slot-busy-{}-{}", surface, i), 2, 600)) logger::info("Texture {}: '{}' is in use ('{}'); skipped", DS::Surface::Name(surface), geometry->name.c_str(), live);
+            if (liveFree && (IsBlank(path) || IsOurs(path))) {
+                if (!ours) ours = geometry;
+                if (IsOurs(path) && DS::LogAllow("tex-reuse-ours", 3, 600)) logger::info("Texture {}: '{}' still has DripSim's placeholder from an earlier run: it is used again", DS::Surface::Name(surface), geometry->name.c_str());
+            } else if (DS::Params::Get().donor && !donor && !IsBlank(path) && material->diffuseTexture->rendererTexture && material->diffuseTexture->rendererTexture->resourceView) {
+                donor = material->diffuseTexture.get();
+                logger::info("Texture {}: donor texture {}", DS::Surface::Name(surface), path);
+            }
+        }
+        if (!ours) {
+            if (DS::LogAllow(std::format("tex-no-slot-{}", surface), 2, 600)) {
+                std::string list;  // what each slot shows: tells which other mod holds the slots
+                for (int i = 0; i <= 9; ++i) {
+                    auto* object = root->GetObjectByName(RE::BSFixedString(std::format("{} [Ovl{}]", DS::Surface::Prefix(surface), i)));
+                    auto* material = MaterialOf(object ? object->AsGeometry() : nullptr);
+                    auto set = material ? material->GetTextureSet() : nullptr;
+                    const char* path = set ? set->GetTexturePath(RE::BSTextureSet::Texture::kDiffuse) : nullptr;
+                    list += std::format("{}{}: {}", list.empty() ? "" : ", ", i, !object ? "(none)" : path && *path ? path : "(no texture)");
+                }
+                logger::warn("Texture {}: no free '{} [Ovl#]' overlay slot (all have a diffuse): {}", DS::Surface::Name(surface), DS::Surface::Prefix(surface), list);
+            }
+            return 0;
+        }
+        auto* material = MaterialOf(ours);
+        auto* lighting = ours->lightingShaderProp_cast();
+        s.shape.reset(ours);
+        s.original = material->diffuseTexture;
+        s.originalSet = material->GetTextureSet();
+        s.originalAlpha = lighting->QMaterialAlpha();
+
+        if (donor && material->diffuseTexture.get() != donor) {
+            s.method = Method::Donor;
+            s.object.reset(donor);
+            if (!SwapIn(s)) {
+                s = Slot{};
+                s.surface = surface;
+                return 0;
+            }
+            // show it on our free slot (the donor's own overlay keeps its low alpha)
+            material->diffuseTexture.reset(donor);
+            lighting->SetMaterialAlpha(1.0f);
+            s.phase = Phase::Running;
+            logger::info("Texture {}: started (donor), {}x{} owned texture on '{}' (parent '{}', hidden {})", DS::Surface::Name(surface), kSize, kSize, ours->name.c_str(),
+                ours->parent && ours->parent->name.c_str() ? ours->parent->name.c_str() : "-", ours->GetFlags().any(RE::NiAVObject::Flag::kHidden));
+            return 1;
+        }
+
+        // no donor: give our slot a texture set with the placeholder DDS and wait for the engine to load it
+        if (!s.originalSet) {
+            logger::warn("Texture {}: the free overlay has no texture set to copy", DS::Surface::Name(surface));
+            s = Slot{};
+            s.surface = surface;
+            return 0;
+        }
+        auto* set = RE::BSShaderTextureSet::Create();
+        if (!set) {
+            s = Slot{};
+            s.surface = surface;
+            return 0;
+        }
+        for (int i = 0; i < 9; ++i) {
+            const char* path = s.originalSet->GetTexturePath(static_cast<RE::BSTextureSet::Texture>(i));
+            if (path && *path) set->SetTexturePath(static_cast<RE::BSTextureSet::Texture>(i), path);
+        }
+        const std::string placeholder = std::format("Drench\\Drips\\surface_{}.dds", DS::Surface::Name(surface));
+        set->SetTexturePath(RE::BSTextureSet::Texture::kDiffuse, placeholder.c_str());
+        s.method = Method::Placeholder;
+        RE::NiPointer<RE::BSTextureSet> keep(set);
+        ClearTextures(material);
+        LoadTextureSet(material, set);
+        // (BSLightingShaderProperty::InvalidateTextures is not called: CommonLibSSE-NG 7.2.0 declares it with an absolute address as its id, which
+        // makes the address library abort. The shader reads material->diffuseTexture->rendererTexture at draw time, which is all we replace.)
+        lighting->SetMaterialAlpha(1.0f);
+        s.loadStarted = std::chrono::steady_clock::now();
+        s.phase = Phase::Loading;
+        if (DS::LogAllow("tex-load")) logger::info("Texture {}: no donor overlay; loading the placeholder {} on '{}'", DS::Surface::Name(surface), placeholder, ours->name.c_str());
+        return 2;
+    }
+
+    int TexturePoll(int surface, int owner)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        return s.owner == owner ? PollLocked(s) : 0;
+    }
+
+    void TextureStop(int surface, int owner)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.owner == owner) StopLocked(s, "stopped by owner");
+    }
+
+    bool TextureRunning(int surface, int owner)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s.attachChecked > std::chrono::milliseconds(400)) {  // a clothes change replaces the overlay shapes: ours would then be an orphan
+            s.attachChecked = now;
+            s.attached = DS::Field::ShapeStillAttached(s.shape.get());
+            if (!s.attached) logger::info("Texture {}: our overlay shape is no longer part of the player's 3D (clothes change or rebuild)", DS::Surface::Name(surface));
+        }
+        return s.attached;
+    }
+
+    bool TextureBusy(int surface, int owner)
+    {
+        std::scoped_lock lock(g_mutex);
+        const auto& s = SlotOf(surface);
+        return s.phase != Phase::Idle && s.owner == owner;
+    }
+
+    void TextureSetFrame(int surface, int owner, const std::uint32_t* pixels)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner || !pixels) return;
+        std::copy_n(pixels, static_cast<std::size_t>(kSize) * kSize, s.pixels.begin());
+        std::fill(s.dirty.begin(), s.dirty.end(), std::uint8_t{ 1 });
+        s.fresh = true;
+    }
+
+    void TextureSetTiles(int surface, int owner, const std::uint32_t* pixels, const std::uint8_t* tiles)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner || !pixels || !tiles || s.dirty.empty()) return;
+        constexpr std::uint32_t kTile = DS::Atlas::kTile;
+        bool any = false;
+        for (std::uint32_t ty = 0; ty < kTilesPerSide; ++ty) {
+            for (std::uint32_t tx = 0; tx < kTilesPerSide; ++tx) {
+                if (!tiles[ty * kTilesPerSide + tx]) continue;
+                for (std::uint32_t y = ty * kTile; y < (ty + 1) * kTile; ++y) {
+                    std::copy_n(pixels + static_cast<std::size_t>(y) * kSize + tx * kTile, kTile, s.pixels.begin() + static_cast<std::ptrdiff_t>(y * kSize + tx * kTile));
+                }
+                s.dirty[ty * kTilesPerSide + tx] = 1;
+                any = true;
+            }
+        }
+        if (any) s.fresh = true;
+    }
+
+    void TextureSetNormalMaps(bool on)
+    {
+        std::scoped_lock lock(g_mutex);
+        g_normalMaps = on;
+    }
+
+    void TextureSetSpecMaps(bool on)
+    {
+        std::scoped_lock lock(g_mutex);
+        g_specMaps = on;
+    }
+
+    void TextureSetPremultiplied(bool on)
+    {
+        std::scoped_lock lock(g_mutex);
+        g_premul = on;
+    }
+
+    bool TextureSpecRunning(int surface)
+    {
+        std::scoped_lock lock(g_mutex);
+        return SlotOf(surface).specState == 2;
+    }
+
+    bool TexturePremultiplied(int surface)
+    {
+        std::scoped_lock lock(g_mutex);
+        return SlotOf(surface).premulApplied == 1;
+    }
+
+    void TextureSetSpecTiles(int surface, int owner, const std::uint32_t* pixels, const std::uint8_t* tiles)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner || s.specState != 2 || !pixels || !tiles || s.sDirty.empty()) return;
+        constexpr std::uint32_t kTile = DS::Atlas::kTile;
+        bool any = false;
+        for (std::uint32_t ty = 0; ty < kTilesPerSide; ++ty) {
+            for (std::uint32_t tx = 0; tx < kTilesPerSide; ++tx) {
+                if (!tiles[ty * kTilesPerSide + tx]) continue;
+                for (std::uint32_t y = ty * kTile; y < (ty + 1) * kTile; ++y) {
+                    std::copy_n(pixels + static_cast<std::size_t>(y) * kSize + tx * kTile, kTile, s.sPixels.begin() + static_cast<std::ptrdiff_t>(y * kSize + tx * kTile));
+                }
+                s.sDirty[ty * kTilesPerSide + tx] = 1;
+                any = true;
+            }
+        }
+        if (any) s.sFresh = true;
+    }
+
+    void TextureSetNormalTiles(int surface, int owner, const std::uint32_t* pixels, const std::uint8_t* tiles)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner || s.normalState != 2 || !pixels || !tiles || s.nDirty.empty()) return;
+        constexpr std::uint32_t kTile = DS::Atlas::kTile;
+        bool any = false;
+        for (std::uint32_t ty = 0; ty < kTilesPerSide; ++ty) {
+            for (std::uint32_t tx = 0; tx < kTilesPerSide; ++tx) {
+                if (!tiles[ty * kTilesPerSide + tx]) continue;
+                for (std::uint32_t y = ty * kTile; y < (ty + 1) * kTile; ++y) {
+                    std::copy_n(pixels + static_cast<std::size_t>(y) * kSize + tx * kTile, kTile, s.nPixels.begin() + static_cast<std::ptrdiff_t>(y * kSize + tx * kTile));
+                }
+                s.nDirty[ty * kTilesPerSide + tx] = 1;
+                any = true;
+            }
+        }
+        if (any) s.nFresh = true;
+    }
+
+    // The upload cost on the render thread since the last call (reset by it).
+    TextureUploadStats TextureTakeUploadStats()
+    {
+        TextureUploadStats out;
+        out.frames = g_upFrames.exchange(0);
+        out.calls = g_upCalls.exchange(0);
+        out.megabytes = static_cast<double>(g_upBytes.exchange(0)) / 1.0e6;
+        out.totalMs = static_cast<double>(g_upNs.exchange(0)) / 1.0e6;
+        out.worstMs = static_cast<double>(g_upWorstNs.exchange(0)) / 1.0e6;
+        out.lockWaitMs = static_cast<double>(g_upLockNs.exchange(0)) / 1.0e6;
+        return out;
+    }
+
+    // Spike (docs/spikes.md S5): screen-space refraction through the overlay's lighting shader. power > 0 sets the refraction flag and the material's
+    // refractionPower on every running overlay (the engine then bends the scene behind the film by its normal map); 0 restores the overlay's own values.
+    void TextureSetRefraction(float power)
+    {
+        std::scoped_lock lock(g_mutex);
+        for (auto& s : g_slots) {
+            if (s.phase != Phase::Running || s.normalState != 2 || !s.shape) continue;
+            auto* material = MaterialOf(s.shape.get());
+            auto* lighting = s.shape->lightingShaderProp_cast();
+            if (!material || !lighting || power == s.lastRefr) continue;
+            if (!s.refrSaved) {
+                if (power <= 0.0f) continue;
+                s.origRefrFlag = lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kRefraction);
+                s.origRefrPower = material->refractionPower;
+                s.refrSaved = true;
+            }
+            const bool on = power > 0.0f;
+            material->refractionPower = on ? power : s.origRefrPower;
+            SetRefractionFlag(lighting, on ? true : s.origRefrFlag);
+            lighting->DoClearRenderPasses();  // the shader technique is chosen when the passes are built
+            s.lastRefr = power;
+            logger::info("Texture {}: refraction {} (power {:.2f}, flag was {}, power was {:.2f})", DS::Surface::Name(s.surface), on ? "on" : "off", power, s.origRefrFlag, s.origRefrPower);
+        }
+    }
+
+    // Spike (docs/spikes.md S7): the patches on the neck and chest (2026-11-11) look like z-fighting between the overlay shape and the skin mesh under it (polygon shapes with
+    // stepped edges, only visible when the overlay covers the whole skin). on = the overlay gets the decal flags (the engine draws decals with a depth bias); the flags
+    // the overlay had are put back on stop. The first look at a running overlay logs its flags either way.
+    void TextureSetDecal(bool on)
+    {
+        using F = RE::BSShaderProperty::EShaderPropertyFlag;
+        std::scoped_lock lock(g_mutex);
+        for (auto& s : g_slots) {
+            if (s.phase != Phase::Running || !s.shape) continue;
+            auto* lighting = s.shape->lightingShaderProp_cast();
+            if (!lighting) continue;
+            if (!s.flagsLogged) {
+                s.flagsLogged = true;
+                logger::info("Texture {}: overlay '{}' flags: decal {}, dynamic decal {}, z test {}, z write {}", DS::Surface::Name(s.surface), s.shape->name.c_str(), lighting->flags.any(F::kDecal),
+                    lighting->flags.any(F::kDynamicDecal), lighting->flags.any(F::kZBufferTest), lighting->flags.any(F::kZBufferWrite));
+            }
+            const int want = on ? 1 : 0;
+            if (s.decalApplied == want || (!on && !s.decalSaved)) continue;
+            if (!s.decalSaved) {
+                s.origDecal = lighting->flags.any(F::kDecal);
+                s.origDynDecal = lighting->flags.any(F::kDynamicDecal);
+                s.origZWrite = lighting->flags.any(F::kZBufferWrite);
+                s.decalSaved = true;
+            }
+            if (on) {
+                lighting->flags.set(F::kDecal);
+                lighting->flags.set(F::kDynamicDecal);
+                lighting->flags.reset(F::kZBufferWrite);  // a see-through overlay must not write depth: the head overlay and the body overlay cover the same neck, and the one drawn first hid parts of the other (polygon patches)
+            } else {
+                if (s.origDecal) lighting->flags.set(F::kDecal);
+                else lighting->flags.reset(F::kDecal);
+                if (s.origDynDecal) lighting->flags.set(F::kDynamicDecal);
+                else lighting->flags.reset(F::kDynamicDecal);
+                if (s.origZWrite) lighting->flags.set(F::kZBufferWrite);
+                else lighting->flags.reset(F::kZBufferWrite);
+            }
+            lighting->DoClearRenderPasses();  // the shader technique and the depth bias are chosen when the passes are built
+            s.decalApplied = want;
+            logger::info("Texture {}: overlay decal flags {}", DS::Surface::Name(s.surface), on ? "ON" : "back to the overlay's own");
+        }
+    }
+
+    void TextureSetSpec(int surface, int owner, bool has, float power, float scale)
+    {
+        std::scoped_lock lock(g_mutex);
+        auto& s = SlotOf(surface);
+        if (s.phase != Phase::Running || s.owner != owner) return;
+        auto* material = MaterialOf(s.shape.get());
+        if (!material) return;
+        auto& memory = g_specMemory[static_cast<std::size_t>(surface)];
+        if (!s.specSaved) {
+            const float nowPower = material->specularPower;
+            const float nowScale = material->specularColorScale;
+            const bool stillOurs = memory.known && memory.set && std::abs(nowPower - memory.setPower) < 1e-3f && std::abs(nowScale - memory.setScale) < 1e-3f;
+            if (stillOurs) {
+                s.origSpecPower = memory.power;
+                s.origSpecScale = memory.scale;
+            } else {
+                s.origSpecPower = nowPower;
+                s.origSpecScale = nowScale;
+                memory.known = true;
+                memory.power = nowPower;
+                memory.scale = nowScale;
+            }
+            s.specSaved = true;
+            if (DS::LogAllow("tex-spec")) logger::info("Texture {}: material specular power {:.1f} scale {:.2f} (saved{})", DS::Surface::Name(surface), s.origSpecPower, s.origSpecScale,
+                stillOurs ? std::format("; the material still had DripSim's {:.1f} / {:.2f}", nowPower, nowScale) : std::string());
+        }
+        const float wantPower = has ? power : s.origSpecPower;
+        const float wantScale = has ? scale : s.origSpecScale;
+        if (wantPower == s.lastPower && wantScale == s.lastScale) return;
+        material->specularPower = wantPower;
+        material->specularColorScale = wantScale;
+        s.lastPower = wantPower;
+        s.lastScale = wantScale;
+        memory.set = true;
+        memory.setPower = wantPower;
+        memory.setScale = wantScale;
+    }
+
+    // Debug (KeyFilmDump): writes the pixels DripSim is showing on each running surface (what the plugin sends to the GPU, before the engine lights it) to
+    // DripSim_film_<surface>.tga in the SKSE log folder (2048x2048, 32 bit). Shows whether a patch on the skin is in the film or comes from the engine's lighting.
+    void TextureDumpFilm()
+    {
+        std::scoped_lock lock(g_mutex);
+        const auto directory = SKSE::log::log_directory();
+        if (!directory) return;
+        int written = 0;
+        for (auto& s : g_slots) {
+            if (s.phase != Phase::Running || s.pixels.empty()) continue;
+            const auto path = *directory / std::format("DripSim_film_{}.tga", DS::Surface::Name(s.surface));
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out) continue;
+            std::uint8_t header[18] = {};
+            header[2] = 2;  // uncompressed true colour
+            header[12] = kSize & 0xFF;
+            header[13] = (kSize >> 8) & 0xFF;
+            header[14] = kSize & 0xFF;
+            header[15] = (kSize >> 8) & 0xFF;
+            header[16] = 32;
+            header[17] = 0x28;  // top-left origin, 8 alpha bits
+            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            std::vector<std::uint8_t> row(static_cast<std::size_t>(kSize) * 4);
+            for (std::uint32_t y = 0; y < kSize; ++y) {
+                for (std::uint32_t x = 0; x < kSize; ++x) {
+                    const std::uint32_t px = s.pixels[static_cast<std::size_t>(y) * kSize + x];  // R in the low byte
+                    row[x * 4 + 0] = static_cast<std::uint8_t>((px >> 16) & 0xFF);
+                    row[x * 4 + 1] = static_cast<std::uint8_t>((px >> 8) & 0xFF);
+                    row[x * 4 + 2] = static_cast<std::uint8_t>(px & 0xFF);
+                    row[x * 4 + 3] = static_cast<std::uint8_t>((px >> 24) & 0xFF);
+                }
+                out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+            }
+            ++written;
+        }
+        logger::info("Texture: film dump written for {} surfaces (DripSim_film_<surface>.tga in the SKSE log folder)", written);
+    }
+}
